@@ -1,0 +1,253 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Servo.h>
+#include <LiquidCrystal_I2C.h>
+#include <SoftwareSerial.h>
+
+// Pin Definitions
+#define RST_PIN 9
+#define SS_PIN 10
+#define TRIG_PIN 6
+#define ECHO_PIN 7
+#define IR_PIN 4
+#define SERVO_PIN 5
+#define PAYMENT_BUTTON_PIN 2
+#define RECHARGE_BUTTON_PIN 3
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+Servo gateServo;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// GSM Module Pins
+#define GSM_RX_PIN 8   // Changed to Pin 8
+#define GSM_TX_PIN 9   // Changed to Pin 9
+SoftwareSerial gsmSerial(GSM_RX_PIN, GSM_TX_PIN);
+
+// Predefined RFID UID and Wallet Balances
+const String validUIDs[] = {"F3E45216", "A1B2C3D4"}; // Add more RFID tags here
+float walletBalances[] = {100.0, 50.0};             // Corresponding wallet balances
+float tollFee = 10.0;                               // Fixed toll fee
+const float rechargeAmount = 50.0;                 // Fixed recharge amount
+const String phoneNumber = "+8801743648510";       // Recipient phone number
+
+// Function Prototypes
+bool detectVehicle();
+String getCardID();
+void openGate();
+int findCardIndex(String cardID);
+bool processPayment(int cardIndex);
+void rechargeWallet(int cardIndex);
+bool isButtonPressed(int pin);
+void sendSMS(String message);
+void checkGSM();
+
+void setup() {
+  Serial.begin(9600);
+  SPI.begin();
+  mfrc522.PCD_Init();
+  
+  gsmSerial.begin(9600); // GSM baud rate (adjust if necessary)
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Toll Booth Ready");
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(IR_PIN, INPUT);
+  pinMode(PAYMENT_BUTTON_PIN, INPUT_PULLUP); // Payment button (not used anymore)
+  pinMode(RECHARGE_BUTTON_PIN, INPUT_PULLUP); // Recharge button
+
+  gateServo.attach(SERVO_PIN);
+  gateServo.write(0); // Gate closed
+  
+  checkGSM(); // Check if GSM module is responding
+}
+
+void loop() {
+  // Detect Vehicle with Ultrasonic Sensor
+  if (detectVehicle()) {
+    lcd.setCursor(0, 0);
+    lcd.print("Vehicle Detected ");
+    delay(500);
+
+    // RFID Card Scan
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      String cardID = getCardID();
+      int cardIndex = findCardIndex(cardID);
+      lcd.setCursor(0, 1);
+      if (cardIndex != -1) {
+        lcd.print("Card Valid      ");
+        delay(1000);
+
+        // Automatically process payment after valid card scan
+        if (processPayment(cardIndex)) {
+          openGate();
+          sendSMS("Your toll fee is paid. Thank you."); // Send SMS on successful payment
+        } else {
+          lcd.setCursor(0, 1);
+          lcd.print("Payment Failed  ");
+          delay(2000);
+        }
+      } else {
+        lcd.print("Access Denied   ");
+        delay(2000);
+      }
+    }
+    mfrc522.PICC_HaltA(); // Halt RFID communication
+    lcd.clear();
+  }
+
+  // Check if the recharge button is pressed
+  if (isButtonPressed(RECHARGE_BUTTON_PIN)) {
+    lcd.clear();
+    lcd.print("Place Card to");
+    lcd.setCursor(0, 1);
+    lcd.print("Recharge...");
+
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      String cardID = getCardID();
+      int cardIndex = findCardIndex(cardID);
+      if (cardIndex != -1) {
+        rechargeWallet(cardIndex);
+      } else {
+        lcd.setCursor(0, 1);
+        lcd.print("Invalid Card    ");
+        delay(2000);
+      }
+    }
+    mfrc522.PICC_HaltA();
+    lcd.clear();
+    lcd.print("Toll Booth Ready");
+  }
+}
+
+// Function Definitions
+bool detectVehicle() {
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, HIGH);
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  int distance = duration * 0.034 / 2; // Convert to cm
+  return (distance < 50); // Adjust threshold as needed
+}
+
+String getCardID() {
+  String cardID = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    if (mfrc522.uid.uidByte[i] < 0x10) cardID += "0"; // Add leading zero if needed
+    cardID += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  cardID.toUpperCase(); // Ensure uppercase for comparison
+  Serial.print("Card ID: ");
+  Serial.println(cardID);
+  return cardID;
+}
+
+int findCardIndex(String cardID) {
+  for (int i = 0; i < sizeof(validUIDs) / sizeof(validUIDs[0]); i++) {
+    if (cardID == validUIDs[i]) {
+      return i;
+    }
+  }
+  return -1; // Card not found
+}
+
+bool processPayment(int cardIndex) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Fee: $");
+  lcd.print(tollFee, 2);
+  lcd.setCursor(0, 1);
+  lcd.print("Processing...");
+
+  // Automatically deduct toll fee if balance is sufficient
+  if (walletBalances[cardIndex] >= tollFee) {
+    walletBalances[cardIndex] -= tollFee;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Payment Success");
+    lcd.setCursor(0, 1);
+    lcd.print("Bal: $");
+    lcd.print(walletBalances[cardIndex], 2);
+    delay(2000);
+    return true;
+  } else {
+    lcd.clear();
+    lcd.print("Insufficient Bal");
+    delay(2000);
+    return false;
+  }
+}
+
+void rechargeWallet(int cardIndex) {
+  walletBalances[cardIndex] += rechargeAmount;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Recharge Success");
+  lcd.setCursor(0, 1);
+  lcd.print("Bal: $");
+  lcd.print(walletBalances[cardIndex], 2);
+  delay(2000);
+}
+
+void openGate() {
+  Serial.println("Opening gate...");
+  gateServo.write(90); // Open gate
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Gate Opened");
+  delay(5000); // Wait for the vehicle to pass
+  Serial.println("Waiting for vehicle to pass...");
+
+  // Wait until IR sensor detects vehicle has passed
+  while (digitalRead(IR_PIN) == LOW) {
+    delay(500); // Avoid spamming serial output
+  }
+
+  Serial.println("Vehicle passed. Closing gate...");
+  lcd.setCursor(0, 0);
+  lcd.print("Closing Gate...");
+  delay(1500); // Extra delay after IR sensor detects vehicle
+  gateServo.write(0); // Close gate
+  lcd.clear();
+  lcd.print("Toll Booth Ready");
+}
+
+// Function to check if a button is pressed (with debouncing)
+bool isButtonPressed(int pin) {
+  static unsigned long lastPressTime = 0;
+  const unsigned long debounceDelay = 200;  // Debounce time in milliseconds
+
+  if (digitalRead(pin) == LOW) {
+    if (millis() - lastPressTime > debounceDelay) {
+      lastPressTime = millis();
+      return true;  // Button was pressed
+    }
+  }
+  return false;  // Button not pressed
+}
+
+// Function to send SMS
+void sendSMS(String message) {
+  gsmSerial.println("AT+CMGF=1");    // Set SMS mode to text
+  delay(1000);
+  gsmSerial.println("AT+CMGS=\"" + phoneNumber + "\""); // Send SMS to phoneNumber
+  delay(1000);
+  gsmSerial.println(message);            // Message content
+  delay(1000);
+  gsmSerial.write(26);                   // Send Ctrl+Z to send the message
+  delay(1000);
+}
+
+void checkGSM() {
+  gsmSerial.println("AT");    // Send AT command to check GSM module status
+  delay(1000);
+  if (gsmSerial.available()) {
+    String response = gsmSerial.readString();
+    Serial.println("GSM Response: " + response);
+  }
+}
